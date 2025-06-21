@@ -1,4 +1,5 @@
 flask
-gunicorn
 requests
+google-cloud-vision
+google-cloud-translate
 flask-cors
