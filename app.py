@@ -84,13 +84,18 @@ def translate_product():
         new_images = []
         for image in product.get('images', []):
             image_url = image.get('src')
+            if not image_url:
+                continue
+
             extracted_text = extract_text_from_image(image_url)
             translated_alt = translate_text(extracted_text)
-            translated_image = {
-                "id": image.get('id'),
-                "alt": translated_alt
-            }
-            new_images.append(translated_image)
+
+            if translated_alt and not translated_alt.startswith("["):
+                translated_image = {
+                    "id": image.get('id'),
+                    "alt": translated_alt
+                }
+                new_images.append(translated_image)
 
         # Shopify PUT request to update product
         payload = {
