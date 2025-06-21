@@ -1,0 +1,2 @@
+# Shopify-Translator
+Shopify Translator
