@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: shopify-translator-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: SHOPIFY_API_KEY
+        value: your-shopify-api-key-here
+      - key: SHOPIFY_STORE
+        value: your-store.myshopify.com
+      - key: GOOGLE_API_KEY
+        value: your-google-api-key-here
