@@ -1,5 +1,3 @@
-# Updated full Flask app code with improved image OCR translation, overlay, and Shopify image replacement support.
-
 import os
 import base64
 import requests
@@ -47,7 +45,7 @@ def extract_text_with_boxes(image_url):
     response = vision_client.text_detection(image=image)
 
     results = []
-    for annotation in response.text_annotations[1:]:  # Skip first entry (entire block)
+    for annotation in response.text_annotations[1:]:  # Skip first block (full text)
         text = annotation.description
         vertices = [(v.x, v.y) for v in annotation.bounding_poly.vertices]
         results.append({'text': text, 'vertices': vertices})
@@ -71,16 +69,12 @@ def replace_text_on_image(image, ocr_results):
         translated = translate_text(original)
         vertices = item['vertices']
 
-        # Estimate bounding box
         x_coords = [v[0] for v in vertices]
         y_coords = [v[1] for v in vertices]
         x_min, y_min = min(x_coords), min(y_coords)
         x_max, y_max = max(x_coords), max(y_coords)
 
-        # Fill rectangle with white background to "erase" text
         draw.rectangle([(x_min, y_min), (x_max, y_max)], fill="white")
-
-        # Overlay translated text
         draw.text((x_min, y_min), translated, fill="black", font=font)
 
     return image
@@ -119,13 +113,11 @@ def translate_product():
         product = data.get('product') or data
         product_id = product['id']
 
-        # Translate title, description, and tags
         new_title = translate_text(product.get('title', ''))
         new_body = translate_text(product.get('body_html', ''))
         tags = product.get('tags', '')
         new_tags = ', '.join([translate_text(tag.strip()) for tag in tags.split(',')]) if tags else ''
 
-        # Translate variants and convert price to KES
         new_variants = []
         for variant in product.get('variants', []):
             price = float(variant.get('price', 0))
@@ -139,19 +131,15 @@ def translate_product():
                 "option3": translate_text(variant.get('option3', ''))
             })
 
-        # Process and upload updated images
         new_image_urls = []
         for image in product.get('images', []):
             image_url = image.get('src')
             ocr_results = extract_text_with_boxes(image_url)
             downloaded_image = download_image(image_url)
             updated_image = replace_text_on_image(downloaded_image, ocr_results)
-            uploaded_response = upload_translated_image_to_shopify(product_id, updated_image)
-            new_url = uploaded_response.get("image", {}).get("src")
-            if new_url:
-                new_image_urls.append(new_url)
+            upload_result = upload_translated_image_to_shopify(product_id, updated_image)
+            new_image_urls.append(upload_result.get('image', {}).get('src'))
 
-        # Shopify PUT request to update product
         headers = {
             "X-Shopify-Access-Token": SHOPIFY_API_KEY,
             "Content-Type": "application/json"
@@ -163,7 +151,7 @@ def translate_product():
                 "title": new_title,
                 "body_html": new_body,
                 "tags": new_tags,
-                "variants": new_variants,
+                "variants": new_variants
             }
         }
 
