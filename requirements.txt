@@ -1,7 +1,7 @@
 flask
+flask-cors
 requests
 google-cloud-vision
 google-cloud-translate
-flask-cors
-gunicorn
 Pillow
+gunicorn
