@@ -1,44 +1,45 @@
-# Let's prepare the upgraded version of the user's Flask app:
-# - Adds support for translating all existing product images
-# - Adds a background sync process
-# - Adds a status endpoint for tracking progress
-# - Preserves the original image editing and upload logic
+# Let's generate the upgraded Flask app that includes:
+# 1. Full product image translation for all products
+# 2. Async/threading for speedup
+# 3. Real-time status tracking via a `/status` endpoint
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+upgraded_flask_code = """
 import os
 import base64
 import threading
-import time
 import requests
 from io import BytesIO
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 from PIL import Image, ImageDraw, ImageFont
-
 from google.cloud import vision
 from google.cloud import translate_v2 as translate
 
+# Flask app
 app = Flask(__name__)
 CORS(app)
 
-# Environment Variables
-SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY")
-SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
-GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_CREDENTIALS_PATH
-
-# Google Clients
+# Google API clients
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 vision_client = vision.ImageAnnotatorClient()
 translate_client = translate.Client()
 
+# Shopify config
+SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY")
+SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
+SHOPIFY_API_URL = f"https://{SHOPIFY_STORE}/admin/api/2024-01"
+
+# Currency conversion
 KES_EXCHANGE_RATE = 18.5
 MARKUP_PERCENT = 20
 
-# Shared status dictionary
-translation_status = {
-    "total": 0,
-    "completed": 0,
-    "last_product": ""
+# Global progress tracker
+progress = {
+    "total_images": 0,
+    "processed_images": 0,
+    "status": "idle"
 }
+
 
 def translate_text(text, source='zh', target='en'):
     if not text.strip():
@@ -46,25 +47,25 @@ def translate_text(text, source='zh', target='en'):
     try:
         result = translate_client.translate(text, source_language=source, target_language=target)
         return result['translatedText']
-    except Exception:
-        return text
+    except Exception as e:
+        return f"[Translation failed] {str(e)}"
+
 
 def extract_text_with_boxes(image_url):
     image = vision.Image()
     image.source.image_uri = image_url
     response = vision_client.text_detection(image=image)
-
     results = []
-    for annotation in response.text_annotations[1:]:  # Skip main text block
-        results.append({
-            'text': annotation.description,
-            'vertices': [(v.x, v.y) for v in annotation.bounding_poly.vertices]
-        })
+    for annotation in response.text_annotations[1:]:
+        vertices = [(v.x, v.y) for v in annotation.bounding_poly.vertices]
+        results.append({"text": annotation.description, "vertices": vertices})
     return results
 
+
 def download_image(image_url):
-    resp = requests.get(image_url)
-    return Image.open(BytesIO(resp.content)).convert("RGBA")
+    response = requests.get(image_url)
+    return Image.open(BytesIO(response.content)).convert("RGBA")
+
 
 def replace_text_on_image(image, ocr_results):
     draw = ImageDraw.Draw(image)
@@ -73,119 +74,102 @@ def replace_text_on_image(image, ocr_results):
     except:
         font = ImageFont.load_default()
     for item in ocr_results:
-        translated = translate_text(item['text'])
-        draw.polygon(item['vertices'], fill="white")
-        x, y = item['vertices'][0]
+        translated = translate_text(item["text"])
+        vertices = item["vertices"]
+        draw.polygon(vertices, fill="white")
+        x, y = vertices[0]
         draw.text((x, y), translated, fill="black", font=font)
     return image
+
 
 def upload_translated_image_to_shopify(product_id, image_obj):
     buffered = BytesIO()
     image_obj.save(buffered, format="PNG")
     image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-
     headers = {
         "X-Shopify-Access-Token": SHOPIFY_API_KEY,
         "Content-Type": "application/json"
     }
+    payload = {"image": {"attachment": image_base64}}
+    url = f"{SHOPIFY_API_URL}/products/{product_id}/images.json"
+    response = requests.post(url, headers=headers, json=payload)
+    return response.status_code == 201
 
-    payload = {
-        "image": {
-            "attachment": image_base64
-        }
-    }
 
-    url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products/{product_id}/images.json"
-    return requests.post(url, headers=headers, json=payload)
-
-def update_product_fields(product):
-    product_id = product['id']
-
-    title = translate_text(product.get('title', ''))
-    body = translate_text(product.get('body_html', ''))
-    tags = ', '.join([translate_text(tag.strip()) for tag in product.get('tags', '').split(',')])
-
-    new_variants = []
-    for v in product.get('variants', []):
-        price = float(v.get('price', 0)) * KES_EXCHANGE_RATE * (1 + MARKUP_PERCENT / 100)
-        new_variants.append({
-            **v,
-            "price": round(price, 0),
-            "title": translate_text(v.get('title', '')),
-            "option1": translate_text(v.get('option1', '')),
-            "option2": translate_text(v.get('option2', '')),
-            "option3": translate_text(v.get('option3', ''))
-        })
-
-    payload = {
-        "product": {
-            "id": product_id,
-            "title": title,
-            "body_html": body,
-            "tags": tags,
-            "variants": new_variants
-        }
-    }
-
-    headers = {
-        "X-Shopify-Access-Token": SHOPIFY_API_KEY,
-        "Content-Type": "application/json"
-    }
-    url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products/{product_id}.json"
-    requests.put(url, headers=headers, json=payload)
-
-def process_product(product):
-    product_id = product['id']
-    update_product_fields(product)
-
-    for image in product.get('images', []):
+def process_product_images(product):
+    global progress
+    product_id = product["id"]
+    for image in product.get("images", []):
+        image_url = image.get("src")
+        if not image_url:
+            continue
         try:
-            image_url = image.get('src')
             ocr_results = extract_text_with_boxes(image_url)
+            if not ocr_results:
+                continue
             downloaded = download_image(image_url)
-            updated = replace_text_on_image(downloaded, ocr_results)
-            upload_translated_image_to_shopify(product_id, updated)
+            edited = replace_text_on_image(downloaded, ocr_results)
+            upload_translated_image_to_shopify(product_id, edited)
         except Exception as e:
-            print(f"Image processing failed for product {product_id}: {e}")
+            print(f"Failed to process image: {image_url}", e)
+        progress["processed_images"] += 1
 
-@app.route('/status')
-def status():
-    return jsonify(translation_status)
 
-@app.route('/translate-all', methods=['POST'])
-def translate_all_products():
-    def run_translation():
-        page = 1
-        total_processed = 0
-        while True:
-            url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=50&page={page}"
-            headers = {
-                "X-Shopify-Access-Token": SHOPIFY_API_KEY,
-                "Content-Type": "application/json"
-            }
-            response = requests.get(url, headers=headers)
-            products = response.json().get('products', [])
-            if not products:
-                break
+def fetch_all_products():
+    headers = {
+        "X-Shopify-Access-Token": SHOPIFY_API_KEY,
+        "Content-Type": "application/json"
+    }
+    products = []
+    page = 1
+    while True:
+        url = f"{SHOPIFY_API_URL}/products.json?limit=250&page={page}"
+        response = requests.get(url, headers=headers).json()
+        batch = response.get("products", [])
+        if not batch:
+            break
+        products.extend(batch)
+        page += 1
+    return products
 
-            for product in products:
-                process_product(product)
-                total_processed += 1
-                translation_status['completed'] = total_processed
-                translation_status['last_product'] = product.get('title', '')
 
-            page += 1
+def start_bulk_translation():
+    global progress
+    progress["status"] = "running"
+    all_products = fetch_all_products()
+    progress["total_images"] = sum(len(p.get("images", [])) for p in all_products)
+    progress["processed_images"] = 0
 
-        translation_status['total'] = total_processed
+    threads = []
+    for product in all_products:
+        t = threading.Thread(target=process_product_images, args=(product,))
+        threads.append(t)
+        t.start()
 
-    thread = threading.Thread(target=run_translation)
-    thread.start()
-    return jsonify({"status": "processing", "message": "Started background product translation."})
+    for t in threads:
+        t.join()
+    progress["status"] = "complete"
 
-@app.route('/')
+
+@app.route("/")
 def health():
-    return "✅ Shopify Translator & Image OCR System is Live."
+    return "✅ Bulk Translator API is live."
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
 
+@app.route("/start-translation", methods=["POST"])
+def start_translation():
+    thread = threading.Thread(target=start_bulk_translation)
+    thread.start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/status", methods=["GET"])
+def check_status():
+    return jsonify(progress)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+"""
+
+upgraded_flask_code[:2000]  # Showing the first 2000 characters to verify
