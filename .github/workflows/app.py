@@ -1,3 +1,5 @@
+# Updated full Flask app code with improved image OCR translation, overlay, and Shopify image replacement support.
+
 import os
 import base64
 import requests
@@ -29,7 +31,7 @@ KES_EXCHANGE_RATE = 18.5
 MARKUP_PERCENT = 20
 
 
-def translate_text(text, source='zh', target='en'):
+def translate_text(text, source='auto', target='en'):
     if not text.strip():
         return text
     try:
@@ -69,12 +71,17 @@ def replace_text_on_image(image, ocr_results):
         translated = translate_text(original)
         vertices = item['vertices']
 
-        # Erase original text
-        draw.polygon(vertices, fill="white")
+        # Estimate bounding box
+        x_coords = [v[0] for v in vertices]
+        y_coords = [v[1] for v in vertices]
+        x_min, y_min = min(x_coords), min(y_coords)
+        x_max, y_max = max(x_coords), max(y_coords)
 
-        # Write new translated text
-        x, y = vertices[0]
-        draw.text((x, y), translated, fill="black", font=font)
+        # Fill rectangle with white background to "erase" text
+        draw.rectangle([(x_min, y_min), (x_max, y_max)], fill="white")
+
+        # Overlay translated text
+        draw.text((x_min, y_min), translated, fill="black", font=font)
 
     return image
 
@@ -133,12 +140,16 @@ def translate_product():
             })
 
         # Process and upload updated images
+        new_image_urls = []
         for image in product.get('images', []):
             image_url = image.get('src')
             ocr_results = extract_text_with_boxes(image_url)
             downloaded_image = download_image(image_url)
             updated_image = replace_text_on_image(downloaded_image, ocr_results)
-            upload_translated_image_to_shopify(product_id, updated_image)
+            uploaded_response = upload_translated_image_to_shopify(product_id, updated_image)
+            new_url = uploaded_response.get("image", {}).get("src")
+            if new_url:
+                new_image_urls.append(new_url)
 
         # Shopify PUT request to update product
         headers = {
@@ -152,7 +163,7 @@ def translate_product():
                 "title": new_title,
                 "body_html": new_body,
                 "tags": new_tags,
-                "variants": new_variants
+                "variants": new_variants,
             }
         }
 
@@ -163,7 +174,8 @@ def translate_product():
         return jsonify({
             "status": "success",
             "product_id": product_id,
-            "translated_title": new_title
+            "translated_title": new_title,
+            "new_images": new_image_urls
         })
 
     except Exception as e:
