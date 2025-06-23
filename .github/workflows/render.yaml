@@ -10,16 +10,10 @@ services:
 
       # Shopify credentials
       - key: SHOPIFY_API_KEY
-        value: your-shopify-api-key-here
+        value: shpat_51e056e3c...  # Replace with full key if truncated
       - key: SHOPIFY_STORE
-        value: your-store.myshopify.com
-      - key: SHOPIFY_ADMIN_API_TOKEN
-        value: your-shopify-admin-api-token-here
+        value: salibay.myshopify.com
 
-      # Google Cloud authentication (use a secret file for service account)
-      - key: GOOGLE_APPLICATION_CREDENTIALS
-        value: /etc/secrets/google-creds.json
-
-    secrets:
-      - source: google-creds.json
-        path: /etc/secrets/google-creds.json
+      # Google Translate API Key
+      - key: GOOGLE_API_KEY
+        value: AIzaSyDzDq...  # Replace with full key if truncated
