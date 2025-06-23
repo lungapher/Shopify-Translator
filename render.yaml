@@ -10,10 +10,10 @@ services:
 
       # Shopify credentials
       - key: SHOPIFY_API_KEY
-        value: shpat_51e056e3c...  # Replace with full key if truncated
+        value: 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
       - key: SHOPIFY_STORE
-        value: salibay.myshopify.com
+        value: 725e1e-4f.myshopify.com
 
       # Google Translate API Key
       - key: GOOGLE_API_KEY
-        value: AIzaSyDzDq...  # Replace with full key if truncated
+        value: AIzaSyBGoqAJDUYMcUb4CIYzhzp_FSMvqEkjirs
