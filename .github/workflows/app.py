@@ -1,4 +1,4 @@
-import os, threading, time, logging, base64, requests
+import os, threading, time, base64, requests
 from io import BytesIO
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -6,127 +6,121 @@ from PIL import Image, ImageDraw, ImageFont
 from google.cloud import vision
 from google.cloud import translate_v2 as translate
 
+# Setup
 app = Flask(__name__)
 CORS(app)
-logging.basicConfig(level=logging.INFO)
-
 SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY")
 SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-
 vision_client = vision.ImageAnnotatorClient()
 translate_client = translate.Client()
 
-status = {"total": 0, "done": 0, "failed": 0, "running": False}
-failures = []
+KES_RATE = float(os.getenv("KES_EXCHANGE_RATE", 18.5))
+MARKUP = float(os.getenv("MARKUP_PERCENT", 20))
 
-def translate_text(text, source='zh', target='en'):
-    try:
-        return translate_client.translate(text, source_language=source, target_language=target)["translatedText"]
-    except Exception as e:
-        logging.warning(f"Translate failed: {e}")
-        return text
+# State tracked in-memory (for simplicity)
+state = {"total": 0, "done": 0, "failed": []}
+lock = threading.Lock()
 
-def ocr_extract(image_url):
-    img = vision.Image()
-    img.source.image_uri = image_url
+def translate_text(text, src='zh', tgt='en'):
+    return translate_client.translate(text or "", src, tgt)["translatedText"]
+
+def extract_boxes(url):
+    img = vision.Image(); img.source.image_uri = url
     res = vision_client.text_detection(image=img)
-    return res.text_annotations[1:] if len(res.text_annotations) > 1 else []
+    return [{
+        "text": a.description,
+        "vertices": [(v.x, v.y) for v in a.bounding_poly.vertices]
+    } for a in res.text_annotations[1:]]
 
-def delete_old_image(image_id):
-    resp = requests.delete(
-        f"https://{SHOPIFY_STORE}/admin/api/2024-01/products/{product_id}/images/{image_id}.json",
-        headers={"X-Shopify-Access-Token": SHOPIFY_API_KEY}
-    )
-    return resp.status_code == 200
+def download(url):
+    return Image.open(BytesIO(requests.get(url).content)).convert("RGBA")
 
-def process_image(product_id, image):
-    image_id = image.get("id")
-    src = image.get("src")
+def update_image_with_text(img, boxes):
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+    for b in boxes:
+        pts = b["vertices"]
+        draw.polygon(pts, fill=(255,255,255,200))
+        draw.text(pts[0], translate_text(b["text"]), fill="black", font=font)
+    return img
+
+def upload_image(product_id, img):
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    payload = {"image": {"attachment": base64.b64encode(buf.getvalue()).decode()}}
+    return requests.post(
+        f"https://{SHOPIFY_STORE}/admin/api/2024-01/products/{product_id}/images.json",
+        headers={"X-Shopify-Access-Token": SHOPIFY_API_KEY, "Content-Type": "application/json"},
+        json=payload)
+
+def process_product(p):
+    pid = p["id"]
     try:
-        ocr = ocr_extract(src)
-        if not ocr:
-            return True
-        img = Image.open(BytesIO(requests.get(src).content)).convert("RGBA")
-        draw = ImageDraw.Draw(img)
-        for ann in ocr:
-            box = [(v.x, v.y) for v in ann.bounding_poly.vertices]
-            draw.polygon(box, fill="white")
-            txt = translate_text(ann.description)
-            draw.text(box[0], txt, fill="black", font=ImageFont.load_default())
-        buff = BytesIO(); img.save(buff, format="PNG")
-        att = base64.b64encode(buff.getvalue()).decode("utf-8")
-        resp = requests.post(
-            f"https://{SHOPIFY_STORE}/admin/api/2024-01/products/{product_id}/images.json",
+        # image logic
+        for img in p.get("images", []):
+            box = extract_boxes(img["src"])
+            if box:
+                new_img = update_image_with_text(download(img["src"]), box)
+                upload_image(pid, new_img)
+        # update other fields
+        variants = []
+        for v in p.get("variants", []):
+            price = float(v["price"])
+            variants.append({
+                **v,
+                "price": round(price * KES_RATE * (1+MARKUP/100), 0),
+                "title": translate_text(v["title"]),
+                "option1": translate_text(v["option1"]),
+                "option2": translate_text(v.get("option2","")),
+                "option3": translate_text(v.get("option3","")),
+            })
+        body = translate_text(p.get("body_html",""))
+        title = translate_text(p.get("title",""))
+        tags = ", ".join(translate_text(t) for t in p.get("tags","").split(","))
+        requests.put(
+            f"https://{SHOPIFY_STORE}/admin/api/2024-01/products/{pid}.json",
             headers={"X-Shopify-Access-Token": SHOPIFY_API_KEY, "Content-Type": "application/json"},
-            json={"image": {"attachment": att}}
+            json={"product": {"id":pid,"title":title,"body_html":body,"tags":tags,"variants":variants}}
         )
-        resp.raise_for_status()
-        if image_id:
-            delete_old_image(image_id)
-        return True
     except Exception as e:
-        logging.error(f"Error on {product_id}/{src}: {e}")
-        return False
+        with lock:
+            state["failed"].append({"id":pid,"error":str(e)})
+    finally:
+        with lock:
+            state["done"] += 1
 
-def process_product(prod):
-    pid = prod["id"]
-    images = prod.get("images", [])
-    ok = all(process_image(pid, img) for img in images)
-    if not ok:
-        failures.append(pid)
-    status["done"] += 1
-    return ok
+@app.route("/start-translation")
+def start():
+    chunk = int(request.args.get("chunk",10))
+    resp = requests.get(f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=250",
+                        headers={"X-Shopify-Access-Token": SHOPIFY_API_KEY})
+    prods = resp.json().get("products", [])
+    state.update({"total": len(prods), "done": 0, "failed": []})
+    threading.Thread(target=lambda: [
+        process_product(p) or time.sleep(1) for p in prods
+    ]).start()
+    return jsonify({"status":"started","total":state["total"]})
 
-def batch_process(chunk):
-    status.update({"running": True, "done": 0, "failed": 0})
-    failures.clear()
-    page = 1
-    products = []
-    while True:
-        resp = requests.get(
-            f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=250&page={page}",
-            headers={"X-Shopify-Access-Token": SHOPIFY_API_KEY}
-        ).json()
-        prods = resp.get("products", [])
-        if not prods:
-            break
-        products.extend(prods)
-        page += 1
-    status["total"] = len(products)
-    for i in range(0, len(products), chunk):
-        for prod in products[i : i + chunk]:
-            process_product(prod)
-        time.sleep(1)
-    status.update({"running": False, "failed": len(failures)})
+@app.route("/status")
+def status():
+    return jsonify({"total": state["total"], "done": state["done"], "failed": state["failed"]})
 
-@app.route("/start-translation", methods=["POST"])
-def start_translation():
-    if status["running"]:
-        return jsonify({"status": "busy"}), 409
-    chunk = max(1, int(request.args.get("chunk", 5)))
-    threading.Thread(target=batch_process, args=(chunk,), daemon=True).start()
-    return jsonify({"status": "started", "chunk": chunk})
-
-@app.route("/status", methods=["GET"])
-def get_status():
-    return jsonify(status)
-
-@app.route("/failed", methods=["GET"])
-def get_failed():
-    return jsonify({"failed_ids": failures})
-
-@app.route("/failed/retry", methods=["POST"])
+@app.route("/failed", methods=["GET","POST"])
 def retry_failed():
-    for pid in list(failures):
-        prod = {"id": pid, "images": []}
-        retry = process_product(prod)
-    status["failed"] = len(failures)
-    return jsonify({"retried": True, "remaining_failed": len(failures)})
+    if request.method=="GET":
+        return jsonify(state["failed"])
+    rets = []
+    for item in list(state["failed"]):
+        process_product({"id":item["id"], **{}})  # minimal
+        rets.append(item["id"])
+        with lock:
+            state["failed"] = [f for f in state["failed"] if f["id"]!=item["id"]]
+    return jsonify({"retried": rets})
 
-@app.route("/", methods=["GET"])
+@app.route("/")
 def health():
-    return "✅ Shopify Translator is active."
+    return "✅ running"
 
-if __name__ == "__main__":
+if __name__=="__main__":
     app.run(host="0.0.0.0", port=5000)
