@@ -5,3 +5,4 @@ google-cloud-translate
 Pillow
 requests
 gunicorn
+python-dotenv
