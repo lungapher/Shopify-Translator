@@ -1,103 +1,107 @@
+# translate_images.py
+
 import os
-import json
-import threading
-import time
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+import io
+import base64
+import requests
+from PIL import Image, ImageDraw, ImageFont
 
-from translate_images import translate_all_images
-from google.oauth2 import service_account
+from google.cloud import vision
+from google.cloud import translate_v2 as translate
 
-app = Flask(__name__)
-CORS(app)
+# Setup clients
+vision_client = vision.ImageAnnotatorClient()
+translate_client = translate.Client()
 
-# === Load Google Credentials from ENV ===
-credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-if not credentials_json:
-    raise Exception("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable")
+SHOPIFY_DOMAIN = os.getenv("SHOPIFY_DOMAIN")  # like mystore.myshopify.com
+SHOPIFY_TOKEN = os.getenv("SHOPIFY_ADMIN_API_TOKEN")
 
-credentials_info = json.loads(credentials_json)
-credentials = service_account.Credentials.from_service_account_info(credentials_info)
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials.json"
 
-# Write credentials to file for Google SDK
-with open("credentials.json", "w") as f:
-    f.write(credentials_json)
+def detect_text(image_url):
+    response = requests.get(image_url)
+    image = vision.Image(content=response.content)
+    result = vision_client.text_detection(image=image)
+    return result.text_annotations
 
-# === Status Store ===
-status = {
-    "running": False,
-    "completed": 0,
-    "failed": [],
-    "total": 0
-}
 
-# === Routes ===
-@app.route('/')
-def home():
-    return jsonify({"message": "Shopify Translator API is running."})
+def translate_text(text, target_lang="en"):
+    result = translate_client.translate(text, target_language=target_lang)
+    return result['translatedText']
 
-@app.route('/status')
-def get_status():
-    return jsonify(status)
 
-@app.route('/failed')
-def get_failed():
-    return jsonify({"failed": status["failed"]})
+def overlay_translation(image_url, annotations):
+    response = requests.get(image_url)
+    image = Image.open(io.BytesIO(response.content)).convert("RGB")
+    draw = ImageDraw.Draw(image)
 
-@app.route('/re-run-failed')
-def re_run_failed():
-    thread = threading.Thread(target=start_translation, kwargs={"retry_failed": True})
-    thread.start()
-    return jsonify({"status": "retrying failed products"})
+    font = ImageFont.load_default()
 
-@app.route('/start-translation')
-def start_translation_route():
-    chunk_size = int(request.args.get("chunk", 10))
-    thread = threading.Thread(target=start_translation, args=(chunk_size,))
-    thread.start()
-    return jsonify({"status": "started", "chunk_size": chunk_size})
+    for annotation in annotations[1:]:  # [0] is the full text block
+        translated = translate_text(annotation.description)
+        vertices = [(v.x, v.y) for v in annotation.bounding_poly.vertices]
+        x0, y0 = vertices[0]
+        x1, y1 = vertices[2]
 
-@app.route('/webhook/product-create', methods=["POST"])
-def product_webhook():
-    thread = threading.Thread(target=start_translation, args=(10,))
-    thread.start()
-    return jsonify({"status": "translation triggered by webhook"})
+        # Draw white rectangle over original text
+        draw.rectangle([x0, y0, x1, y1], fill="white")
+        draw.text((x0, y0), translated, fill="black", font=font)
 
-# === Translation Trigger Function ===
-def start_translation(chunk_size=10, retry_failed=False):
-    if status["running"]:
-        print("Translation already in progress...")
-        return
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG")
+    buffer.seek(0)
 
-    status["running"] = True
-    try:
-        print(f"🚀 Starting {'failed retry' if retry_failed else 'full'} translation (chunk={chunk_size})")
-        result = translate_all_images(chunk_size=chunk_size, retry_failed=retry_failed)
-        status["completed"] = result["completed"]
-        status["failed"] = result["failed"]
-        status["total"] = result["total"]
-        print("✅ Translation finished")
-    except Exception as e:
-        print("❌ Translation failed:", e)
-    finally:
-        status["running"] = False
+    return buffer
 
-# === Background Tasks ===
-def auto_start_translation():
-    time.sleep(5)
-    print("🔄 Auto-starting translation at startup...")
-    start_translation(chunk_size=10)
 
-def auto_retry_failed_every_hour():
-    while True:
-        time.sleep(3600)
-        if status["failed"]:
-            print("⏳ Auto-retrying failed products...")
-            start_translation(retry_failed=True)
+def upload_to_shopify(product_id, image_bytes, original_image_id=None):
+    url = f"https://{SHOPIFY_DOMAIN}/admin/api/2024-01/products/{product_id}/images.json"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": SHOPIFY_TOKEN
+    }
 
-# === Main Entry ===
-if __name__ == '__main__':
-    threading.Thread(target=auto_start_translation).start()
-    threading.Thread(target=auto_retry_failed_every_hour, daemon=True).start()
-    app.run(host='0.0.0.0', port=5000)
+    # Convert image to base64
+    encoded_image = base64.b64encode(image_bytes.read()).decode()
+
+    image_data = {
+        "image": {
+            "attachment": encoded_image
+        }
+    }
+
+    if original_image_id:
+        # Replace original image
+        url = f"{url}/{original_image_id}.json"
+        response = requests.put(url, headers=headers, json=image_data)
+    else:
+        # Upload new image
+        response = requests.post(url, headers=headers, json=image_data)
+
+    return response.status_code, response.json()
+
+
+def translate_all_images():
+    # 1. Get all products
+    products = requests.get(
+        f"https://{SHOPIFY_DOMAIN}/admin/api/2024-01/products.json",
+        headers={"X-Shopify-Access-Token": SHOPIFY_TOKEN}
+    ).json().get("products", [])
+
+    failed = []
+
+    for product in products:
+        product_id = product["id"]
+        for image in product["images"]:
+            try:
+                annotations = detect_text(image["src"])
+                if not annotations:
+                    continue
+                translated_img = overlay_translation(image["src"], annotations)
+                upload_to_shopify(product_id, translated_img, image["id"])
+            except Exception as e:
+                failed.append({"product_id": product_id, "image_id": image["id"], "error": str(e)})
+
+    return {
+        "status": "done",
+        "failed": failed
+    }
