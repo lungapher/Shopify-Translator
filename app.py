@@ -1,143 +1,108 @@
-import os
-import base64
-import requests
+import os, threading, time, logging, base64, requests
 from io import BytesIO
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image, ImageDraw, ImageFont
-import threading
-
-# Google Cloud Clients
 from google.cloud import vision
 from google.cloud import translate_v2 as translate
 
-# Flask Setup
 app = Flask(__name__)
 CORS(app)
+logging.basicConfig(level=logging.INFO)
 
-# Environment Configs
+# Config
 SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY")
 SHOPIFY_STORE = os.getenv("SHOPIFY_STORE")
-GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_CREDENTIALS_PATH
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_APPLICATION_CREDENTIALS
 
-# Google Clients
+# Clients
 vision_client = vision.ImageAnnotatorClient()
 translate_client = translate.Client()
 
-# Constants
-KES_EXCHANGE_RATE = 18.5
-MARKUP_PERCENT = 20
-
-# Global progress tracking
-progress = {"total": 0, "completed": 0, "running": False}
+# Progress track
+status = {"total":0,"done":0,"failed":0,"running":False}
+failures = []
 
 def translate_text(text, source='zh', target='en'):
-    if not text.strip():
-        return text
     try:
-        result = translate_client.translate(text, source_language=source, target_language=target)
-        return result['translatedText']
+        res = translate_client.translate(text, source_language=source, target_language=target)
+        return res["translatedText"]
     except Exception as e:
-        return f"[Translation failed] {str(e)}"
+        logging.warning(f"Translate fail: {e}")
+        return text
 
-def extract_text_with_boxes(image_url):
-    image = vision.Image()
-    image.source.image_uri = image_url
-    response = vision_client.text_detection(image=image)
-    results = []
-    for annotation in response.text_annotations[1:]:
-        text = annotation.description
-        vertices = [(v.x, v.y) for v in annotation.bounding_poly.vertices]
-        results.append({'text': text, 'vertices': vertices})
-    return results
+def ocr_extract(image_url):
+    img = vision.Image()
+    img.source.image_uri = image_url
+    res = vision_client.text_detection(image=img)
+    return res.text_annotations[1:] if len(res.text_annotations)>1 else []
 
-def download_image(image_url):
-    response = requests.get(image_url)
-    return Image.open(BytesIO(response.content)).convert("RGBA")
+def process_image(product_id, image):
+    image_url = image.get("src")
+    for ann in ocr_extract(image_url):
+        box = [(v.x, v.y) for v in ann.bounding_poly.vertices]
+        text = ann.description
+        img = Image.open(BytesIO(requests.get(image_url).content)).convert("RGBA")
+        draw = ImageDraw.Draw(img)
+        draw.polygon(box, fill="white")
+        translated = translate_text(text)
+        draw.text(box[0], translated, fill="black", font=ImageFont.load_default())
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        att = base64.b64encode(buf.getvalue()).decode("utf-8")
+        resp = requests.post(f"https://{SHOPIFY_STORE}/admin/api/2024-01/products/{product_id}/images.json",
+                             headers={
+                               "X-Shopify-Access-Token": SHOPIFY_API_KEY,
+                               "Content-Type":"application/json"
+                             },
+                             json={"image":{"attachment":att}})
+        if resp.status_code != 201:
+            failures.append((product_id, image_url))
+    status["done"] += 1
 
-def replace_text_on_image(image, ocr_results):
-    draw = ImageDraw.Draw(image)
-    try:
-        font = ImageFont.truetype("arial.ttf", 24)
-    except:
-        font = ImageFont.load_default()
-    for item in ocr_results:
-        original = item['text']
-        translated = translate_text(original)
-        vertices = item['vertices']
-        draw.polygon(vertices, fill="white")
-        x, y = vertices[0]
-        draw.text((x, y), translated, fill="black", font=font)
-    return image
+def batch_process(chunk):
+    status.update({"running":True,"done":0,"failed":0,"total":0})
+    failures.clear()
+    res = requests.get(f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=250",
+                       headers={"X-Shopify-Access-Token":SHOPIFY_API_KEY}).json()
+    prods = res["products"]
+    status["total"] = len(prods)
+    for i in range(0, len(prods), chunk):
+        for prod in prods[i:i+chunk]:
+            for img in prod.get("images", []):
+                process_image(prod["id"], img)
+            time.sleep(1)
+    status["running"] = False
+    status["failed"] = len(failures)
 
-def upload_translated_image_to_shopify(product_id, image_obj):
-    buffered = BytesIO()
-    image_obj.save(buffered, format="PNG")
-    image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    headers = {
-        "X-Shopify-Access-Token": SHOPIFY_API_KEY,
-        "Content-Type": "application/json"
-    }
-    payload = {"image": {"attachment": image_base64}}
-    url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products/{product_id}/images.json"
-    response = requests.post(url, headers=headers, json=payload)
-    return response.json()
-
-def process_product(product):
-    product_id = product['id']
-    for image in product.get('images', []):
-        image_url = image.get('src')
-        ocr_results = extract_text_with_boxes(image_url)
-        downloaded_image = download_image(image_url)
-        updated_image = replace_text_on_image(downloaded_image, ocr_results)
-        upload_translated_image_to_shopify(product_id, updated_image)
-    progress["completed"] += 1
-
-def process_all_products():
-    progress["running"] = True
-    products = fetch_all_products()
-    progress["total"] = len(products)
-    progress["completed"] = 0
-    for product in products:
-        process_product(product)
-    progress["running"] = False
-
-def fetch_all_products():
-    headers = {
-        "X-Shopify-Access-Token": SHOPIFY_API_KEY,
-        "Content-Type": "application/json"
-    }
-    products = []
-    url = f"https://{SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=250"
-    while url:
-        response = requests.get(url, headers=headers)
-        data = response.json()
-        products.extend(data.get("products", []))
-        link_header = response.headers.get("Link", "")
-        if 'rel="next"' in link_header:
-            parts = link_header.split(";")
-            next_url = parts[0].strip("<> ")
-            url = next_url
-        else:
-            url = None
-    return products
-
-@app.route('/')
-def health():
-    return "✅ Shopify Translator is live."
-
-@app.route('/start-translation', methods=['POST'])
+@app.route("/start-translation", methods=["POST"])
 def start_translation():
-    if progress["running"]:
-        return jsonify({"status": "already_running"}), 400
-    threading.Thread(target=process_all_products).start()
-    return jsonify({"status": "started"})
+    if status["running"]:
+        return jsonify({"status":"busy"}), 409
+    chunk = int(request.args.get("chunk", 5))
+    thread = threading.Thread(target=batch_process, args=(chunk,))
+    thread.start()
+    return jsonify({"status":"started","chunk":chunk})
 
-@app.route('/status', methods=['GET'])
+@app.route("/status", methods=["GET"])
 def get_status():
-    return jsonify(progress)
+    return jsonify(status)
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+@app.route("/failed", methods=["GET"])
+def get_failed():
+    return jsonify({"failed":failures})
 
+@app.route("/failed/retry", methods=["POST"])
+def retry_failed():
+    for pid, url in list(failures):
+        process_image(pid, {"src":url})
+    status["failed"] = len(failures)
+    return jsonify({"retried":True,"remaining_failed":len(failures)})
+
+@app.route("/", methods=["GET"])
+def health():
+    return "✅ Upgraded Shopify Translator is live."
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0",port=5000)
