@@ -1,43 +1,103 @@
 import os
 import json
+import threading
 import time
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from google.cloud import vision
-from google.cloud import translate_v2 as translate
+
+from translate_images import translate_all_images
 from google.oauth2 import service_account
 
-# Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
-# Load credentials from environment variable
-creds_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-if not creds_json:
+# === Load Google Credentials from ENV ===
+credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+if not credentials_json:
     raise Exception("Missing GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable")
 
-credentials = service_account.Credentials.from_service_account_info(json.loads(creds_json))
+credentials_info = json.loads(credentials_json)
+credentials = service_account.Credentials.from_service_account_info(credentials_info)
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials.json"
 
-# Initialize Google Cloud clients
-vision_client = vision.ImageAnnotatorClient(credentials=credentials)
-translate_client = translate.Client(credentials=credentials)
+# Write credentials to file for Google SDK
+with open("credentials.json", "w") as f:
+    f.write(credentials_json)
 
-# Health check
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({"message": "Shopify Translator is running!"})
+# === Status Store ===
+status = {
+    "running": False,
+    "completed": 0,
+    "failed": [],
+    "total": 0
+}
 
-# Endpoint to start translation
-@app.route("/start-translation", methods=["GET"])
-def start_translation():
-    chunk = int(request.args.get("chunk", 10))
-    # Placeholder logic for now
-    return jsonify({"status": "started", "chunk_size": chunk})
+# === Routes ===
+@app.route('/')
+def home():
+    return jsonify({"message": "Shopify Translator API is running."})
 
-# Endpoint to handle failed cases
-@app.route("/failed", methods=["GET"])
+@app.route('/status')
+def get_status():
+    return jsonify(status)
+
+@app.route('/failed')
 def get_failed():
-    return jsonify({"failed": []})
+    return jsonify({"failed": status["failed"]})
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+@app.route('/re-run-failed')
+def re_run_failed():
+    thread = threading.Thread(target=start_translation, kwargs={"retry_failed": True})
+    thread.start()
+    return jsonify({"status": "retrying failed products"})
+
+@app.route('/start-translation')
+def start_translation_route():
+    chunk_size = int(request.args.get("chunk", 10))
+    thread = threading.Thread(target=start_translation, args=(chunk_size,))
+    thread.start()
+    return jsonify({"status": "started", "chunk_size": chunk_size})
+
+@app.route('/webhook/product-create', methods=["POST"])
+def product_webhook():
+    thread = threading.Thread(target=start_translation, args=(10,))
+    thread.start()
+    return jsonify({"status": "translation triggered by webhook"})
+
+# === Translation Trigger Function ===
+def start_translation(chunk_size=10, retry_failed=False):
+    if status["running"]:
+        print("Translation already in progress...")
+        return
+
+    status["running"] = True
+    try:
+        print(f"🚀 Starting {'failed retry' if retry_failed else 'full'} translation (chunk={chunk_size})")
+        result = translate_all_images(chunk_size=chunk_size, retry_failed=retry_failed)
+        status["completed"] = result["completed"]
+        status["failed"] = result["failed"]
+        status["total"] = result["total"]
+        print("✅ Translation finished")
+    except Exception as e:
+        print("❌ Translation failed:", e)
+    finally:
+        status["running"] = False
+
+# === Background Tasks ===
+def auto_start_translation():
+    time.sleep(5)
+    print("🔄 Auto-starting translation at startup...")
+    start_translation(chunk_size=10)
+
+def auto_retry_failed_every_hour():
+    while True:
+        time.sleep(3600)
+        if status["failed"]:
+            print("⏳ Auto-retrying failed products...")
+            start_translation(retry_failed=True)
+
+# === Main Entry ===
+if __name__ == '__main__':
+    threading.Thread(target=auto_start_translation).start()
+    threading.Thread(target=auto_retry_failed_every_hour, daemon=True).start()
+    app.run(host='0.0.0.0', port=5000)
