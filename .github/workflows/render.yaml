@@ -7,13 +7,14 @@ services:
     envVars:
       - key: PORT
         value: 10000
-
-      # Shopify credentials
       - key: SHOPIFY_API_KEY
-        value: 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
+        value: b550e1e2277eecf7a942b32a4c67d8ef
       - key: SHOPIFY_STORE
-        value: 725e1e-4f.myshopify.com
-
-      # Google Translate API Key
+        value: trippledee.myshopify.com
       - key: GOOGLE_API_KEY
-        value: AIzaSyBGoqAJDUYMcUb4CIYzhzp_FSMvqEkjirs
+        value: AIzaSyCA1K-YCqIUkMkr6uwKoDceM_Ocpym2v-M
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/google-creds.json
+    secrets:
+      - source: google-creds.json
+        path: /etc/secrets/google-creds.json
