@@ -7,9 +7,19 @@ services:
     envVars:
       - key: PORT
         value: 10000
+
+      # Shopify credentials
       - key: SHOPIFY_API_KEY
         value: your-shopify-api-key-here
       - key: SHOPIFY_STORE
         value: your-store.myshopify.com
-      - key: GOOGLE_API_KEY
-        value: your-google-api-key-here
+      - key: SHOPIFY_ADMIN_API_TOKEN
+        value: your-shopify-admin-api-token-here
+
+      # Google Cloud authentication (use a secret file for service account)
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/google-creds.json
+
+    secrets:
+      - source: google-creds.json
+        path: /etc/secrets/google-creds.json
