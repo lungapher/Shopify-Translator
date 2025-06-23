@@ -22,13 +22,16 @@ translate_client = translate.Client()
 
 failed_translations = []
 
+# Detect language of the text
 def detect_language(text):
     result = translate_client.detect_language(text)
     return result["language"]
 
+# Translate to English
 def translate_text(text, target="en"):
     return translate_client.translate(text, target_language=target)["translatedText"]
 
+# Overlay translated text onto image
 def overlay_text(image_content, ocr_response):
     image = Image.open(BytesIO(image_content)).convert("RGBA")
     draw = ImageDraw.Draw(image)
@@ -42,6 +45,7 @@ def overlay_text(image_content, ocr_response):
     image.save(output, format="PNG")
     return output.getvalue()
 
+# Process a single product image
 def process_image(product_id, image):
     try:
         image_url = image["src"]
@@ -63,8 +67,9 @@ def process_image(product_id, image):
 
         update_image_on_shopify(product_id, image_id, filename, encoded_img)
     except Exception as e:
-        failed_translations.append({"product_id": product_id, "image_id": image["id"], "error": str(e)})
+        failed_translations.append({"product_id": product_id, "image_id": image.get("id"), "error": str(e)})
 
+# Re-upload new translated image to Shopify
 def update_image_on_shopify(product_id, image_id, filename, encoded_img):
     url = f"https://{SHOPIFY_API_KEY}:{SHOPIFY_API_PASS}@{SHOPIFY_STORE}/admin/api/2023-07/products/{product_id}/images/{image_id}.json"
     payload = {
@@ -75,13 +80,14 @@ def update_image_on_shopify(product_id, image_id, filename, encoded_img):
     }
     requests.put(url, json=payload)
 
+# Process all products (existing)
 def process_all_products():
     try:
         page = 1
         while True:
             url = f"https://{SHOPIFY_API_KEY}:{SHOPIFY_API_PASS}@{SHOPIFY_STORE}/admin/api/2023-07/products.json?limit=250&page={page}"
-            res = requests.get(url).json()
-            products = res.get("products", [])
+            res = requests.get(url)
+            products = res.json().get("products", [])
             if not products:
                 break
             for product in products:
@@ -91,23 +97,37 @@ def process_all_products():
     except Exception as e:
         print("Processing error:", str(e))
 
+# ✅ Trigger full translation via /start-translation
 @app.route("/start-translation", methods=["GET"])
 def start_translation():
     thread = threading.Thread(target=process_all_products)
     thread.start()
     return jsonify({"status": "Translation started in background"}), 200
 
+# ✅ View failed translations
 @app.route("/failed", methods=["GET"])
 def get_failed():
     return jsonify({"failed": failed_translations}), 200
 
+# ✅ Shopify Webhook for product updates
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
-    if data.get("id"):
-        threading.Thread(target=lambda: process_image(data["id"], data.get("image", {}))).start()
+    product_id = data.get("id")
+    if product_id:
+        def process():
+            try:
+                url = f"https://{SHOPIFY_API_KEY}:{SHOPIFY_API_PASS}@{SHOPIFY_STORE}/admin/api/2023-07/products/{product_id}.json"
+                res = requests.get(url)
+                product = res.json().get("product", {})
+                for image in product.get("images", []):
+                    process_image(product_id, image)
+            except Exception as e:
+                failed_translations.append({"product_id": product_id, "error": str(e)})
+        threading.Thread(target=process).start()
     return "", 200
 
+# Root status check
 @app.route("/", methods=["GET"])
 def index():
     return "🟢 Shopify Translator API Running"
