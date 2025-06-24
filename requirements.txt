@@ -6,3 +6,4 @@ Pillow
 requests
 gunicorn
 python-dotenv
+aiohttp
