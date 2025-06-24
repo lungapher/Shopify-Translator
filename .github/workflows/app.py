@@ -13,10 +13,9 @@ from io import BytesIO
 app = Flask(__name__)
 CORS(app)
 
-# Config
-SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE")
-SHOPIFY_API_KEY = os.environ.get("SHOPIFY_API_KEY")
-SHOPIFY_API_PASS = os.environ.get("SHOPIFY_API_PASS")
+# Config from environment variables
+SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE")  # e.g. 725e1e-4f.myshopify.com
+SHOPIFY_ADMIN_API_ACCESS_TOKEN = os.environ.get("SHOPIFY_ADMIN_API_ACCESS_TOKEN")
 vision_client = vision.ImageAnnotatorClient()
 translate_client = translate.Client()
 
@@ -44,15 +43,21 @@ def overlay_text(image_content, ocr_response):
     image.save(output, format="PNG")
     return output.getvalue()
 
+def shopify_headers():
+    return {
+        "X-Shopify-Access-Token": SHOPIFY_ADMIN_API_ACCESS_TOKEN,
+        "Content-Type": "application/json",
+    }
+
 def update_image_on_shopify(product_id, image_id, filename, encoded_img):
-    url = f"https://{SHOPIFY_API_KEY}:{SHOPIFY_API_PASS}@{SHOPIFY_STORE}/admin/api/2023-07/products/{product_id}/images/{image_id}.json"
+    url = f"https://{SHOPIFY_STORE}/admin/api/2023-07/products/{product_id}/images/{image_id}.json"
     payload = {
         "image": {
             "attachment": encoded_img,
             "filename": filename
         }
     }
-    requests.put(url, json=payload)
+    requests.put(url, headers=shopify_headers(), json=payload)
 
 def process_image(product_id, image):
     try:
@@ -78,7 +83,7 @@ def process_image(product_id, image):
     except Exception as e:
         failed_translations.append({
             "product_id": product_id,
-            "image_id": image["id"],
+            "image_id": image.get("id"),
             "error": str(e)
         })
 
@@ -86,8 +91,8 @@ def process_all_products():
     try:
         page = 1
         while True:
-            url = f"https://{SHOPIFY_API_KEY}:{SHOPIFY_API_PASS}@{SHOPIFY_STORE}/admin/api/2023-07/products.json?limit=250&page={page}"
-            res = requests.get(url).json()
+            url = f"https://{SHOPIFY_STORE}/admin/api/2023-07/products.json?limit=250&page={page}"
+            res = requests.get(url, headers=shopify_headers()).json()
             products = res.get("products", [])
             if not products:
                 break
@@ -118,8 +123,8 @@ def webhook():
     product_id = data.get("id")
     if product_id:
         try:
-            url = f"https://{SHOPIFY_API_KEY}:{SHOPIFY_API_PASS}@{SHOPIFY_STORE}/admin/api/2023-07/products/{product_id}.json"
-            res = requests.get(url).json()
+            url = f"https://{SHOPIFY_STORE}/admin/api/2023-07/products/{product_id}.json"
+            res = requests.get(url, headers=shopify_headers()).json()
             product = res.get("product")
             if product:
                 for image in product.get("images", []):
